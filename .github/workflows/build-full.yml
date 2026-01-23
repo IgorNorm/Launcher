@@ -9,10 +9,6 @@ on:
         description: 'Optional upstream repo URL (HTTPS). Leave empty to skip.'
         required: false
 
-env:
-  # Якщо хочеш, можна встановити UPSTREAM_REPO як repository variable або secret in repo settings.
-  # UPSTREAM_REPO: ''
-
 permissions:
   contents: read
 
@@ -31,11 +27,11 @@ jobs:
       - name: Determine upstream URL
         id: upstream
         run: |
-          # priority: workflow_dispatch input -> env UPSTREAM_REPO -> empty
+          # priority: workflow_dispatch input -> repository variable UPSTREAM_REPO -> empty
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.upstream_repo }}" ]; then
             echo "url=${{ github.event.inputs.upstream_repo }}" >> $GITHUB_OUTPUT
-          elif [ -n "${{ env.UPSTREAM_REPO }}" ]; then
-            echo "url=${{ env.UPSTREAM_REPO }}" >> $GITHUB_OUTPUT
+          elif [ -n "${{ vars.UPSTREAM_REPO }}" ]; then
+            echo "url=${{ vars.UPSTREAM_REPO }}" >> $GITHUB_OUTPUT
           else
             echo "url=" >> $GITHUB_OUTPUT
           fi
@@ -53,15 +49,12 @@ jobs:
             exit 0
           fi
 
-          # If token provided, rewrite URL to include token for HTTPS auth
           if [ -n "${UPSTREAM_TOKEN:-}" ]; then
-            # support URLs like https://gitlab.com/owner/repo.git
             AUTH_URL=$(echo "$UPSTREAM" | sed -E "s#https://#https://x-access-token:${UPSTREAM_TOKEN}@#")
           else
             AUTH_URL="$UPSTREAM"
           fi
 
-          # Validate remote reachable
           if git ls-remote "$AUTH_URL" &>/dev/null; then
             echo "Upstream reachable."
             if git remote get-url upstream &>/dev/null; then
@@ -71,7 +64,6 @@ jobs:
             fi
             git fetch upstream --tags --prune
 
-            # try to resolve HEAD or common branches
             UPSTREAM_REF=$(git rev-parse --verify upstream/HEAD 2>/dev/null || true)
             if [ -z "$UPSTREAM_REF" ]; then
               for b in upstream/main upstream/master upstream/develop; do
@@ -106,7 +98,6 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           set -e
-          # prefer repo-provided build script
           if [ -f ./build_linux.sh ]; then
             chmod +x ./build_linux.sh
             ./build_linux.sh
@@ -123,8 +114,6 @@ jobs:
         run: |
           Write-Host "Windows runner: Visual Studio should be preinstalled on hosted runner."
           choco feature enable -n allowGlobalConfirmation || true
-          # optional: install tools if needed (uncomment if you want)
-          # choco install -y cmake --installargs 'ADD_CMAKE_TO_PATH=System' || true
 
       - name: Build on Windows
         if: matrix.os == 'windows-latest'
@@ -132,10 +121,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if (Test-Path .\build_win_release.bat) {
-            Write-Host "Running repo build script build_win_release.bat"
             .\build_win_release.bat
           } else {
-            # Try CMake + Visual Studio generator
             if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build | Out-Null }
             cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
             cmake --build build --config Release -- /m
@@ -145,13 +132,10 @@ jobs:
         run: |
           set -e || true
           mkdir -p release_artifacts || true
-          # Linux paths
           if [ -d build/bin ]; then cp -r build/bin/* release_artifacts/ 2>/dev/null || true; fi
           if [ -d bin ]; then cp -r bin/* release_artifacts/ 2>/dev/null || true; fi
           if [ -f goldberg ]; then cp goldberg release_artifacts/ 2>/dev/null || true; fi
-          # Windows: copy if present (works on both shells)
           if [ -d build/Release ]; then cp -r build/Release/* release_artifacts/ 2>/dev/null || true; fi
-          if [ -d build ]; then find build -maxdepth 3 -type f -executable -exec cp {} release_artifacts/ \; 2>/dev/null || true; fi
           ls -la release_artifacts || true
 
       - name: Upload artifacts
