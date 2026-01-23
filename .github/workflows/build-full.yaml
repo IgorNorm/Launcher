@@ -1,4 +1,4 @@
-name: Build Goldberg (Linux + Windows)
+name: Build Goldberg Multi-OS
 
 on:
   push:
@@ -6,39 +6,94 @@ on:
   workflow_dispatch:
     inputs:
       upstream_repo:
-        description: 'Optional upstream repo URL to ensure latest (e.g. https://gitlab.com/Mr_Goldberg/goldberg_emulator.git)'
+        description: 'Optional upstream repo URL (HTTPS). Leave empty to skip.'
         required: false
+
+env:
+  # Якщо хочеш, можна встановити UPSTREAM_REPO як repository variable або secret in repo settings.
+  # UPSTREAM_REPO: ''
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-    permissions:
-      contents: read
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout (full history)
+      - name: Checkout repository (full history)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Ensure latest from upstream if provided
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upstream_repo != '' }} || ${{ github.event_name != 'workflow_dispatch' && env.UPSTREAM_REPO != '' }}
-        env:
-          UPSTREAM: ${{ github.event_name == 'workflow_dispatch' && inputs.upstream_repo || env.UPSTREAM_REPO }}
+      - name: Determine upstream URL
+        id: upstream
         run: |
-          git remote add upstream "$UPSTREAM" || true
-          git fetch upstream --tags --prune
-          UPSTREAM_HEAD=$(git rev-parse upstream/HEAD || git rev-parse upstream/master || true)
-          if [ -n "$UPSTREAM_HEAD" ]; then
-            echo "Found upstream HEAD: $UPSTREAM_HEAD"
-            git checkout -B build-upstream "$UPSTREAM_HEAD"
+          # priority: workflow_dispatch input -> env UPSTREAM_REPO -> empty
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.upstream_repo }}" ]; then
+            echo "url=${{ github.event.inputs.upstream_repo }}" >> $GITHUB_OUTPUT
+          elif [ -n "${{ env.UPSTREAM_REPO }}" ]; then
+            echo "url=${{ env.UPSTREAM_REPO }}" >> $GITHUB_OUTPUT
           else
-            echo "No upstream HEAD found, staying on current checkout"
+            echo "url=" >> $GITHUB_OUTPUT
           fi
 
-      - name: Setup build deps (Linux)
+      - name: Ensure latest from upstream safely
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.url }}
+          # If upstream is private and requires token, set UPSTREAM_TOKEN in repo secrets and uncomment:
+          # UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
+        run: |
+          set -e
+          echo "UPSTREAM='$UPSTREAM'"
+          if [ -z "$UPSTREAM" ]; then
+            echo "No upstream provided; skipping upstream sync."
+            exit 0
+          fi
+
+          # If token provided, rewrite URL to include token for HTTPS auth
+          if [ -n "${UPSTREAM_TOKEN:-}" ]; then
+            # support URLs like https://gitlab.com/owner/repo.git
+            AUTH_URL=$(echo "$UPSTREAM" | sed -E "s#https://#https://x-access-token:${UPSTREAM_TOKEN}@#")
+          else
+            AUTH_URL="$UPSTREAM"
+          fi
+
+          # Validate remote reachable
+          if git ls-remote "$AUTH_URL" &>/dev/null; then
+            echo "Upstream reachable."
+            if git remote get-url upstream &>/dev/null; then
+              git remote set-url upstream "$AUTH_URL"
+            else
+              git remote add upstream "$AUTH_URL"
+            fi
+            git fetch upstream --tags --prune
+
+            # try to resolve HEAD or common branches
+            UPSTREAM_REF=$(git rev-parse --verify upstream/HEAD 2>/dev/null || true)
+            if [ -z "$UPSTREAM_REF" ]; then
+              for b in upstream/main upstream/master upstream/develop; do
+                if git rev-parse --verify "$b" >/dev/null 2>&1; then
+                  UPSTREAM_REF=$(git rev-parse "$b")
+                  break
+                fi
+              done
+            fi
+
+            if [ -n "$UPSTREAM_REF" ]; then
+              echo "Checking out upstream ref"
+              git checkout -B build-upstream "$UPSTREAM_REF"
+            else
+              echo "No upstream ref found; staying on current checkout."
+            fi
+          else
+            echo "Upstream not reachable or invalid: $UPSTREAM"
+            exit 0
+          fi
+
+      - name: Setup build dependencies Linux
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
@@ -47,45 +102,56 @@ jobs:
             libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
             libxi-dev libgl1-mesa-dev ccache || true
 
-      - name: Build (Linux)
+      - name: Build on Linux
         if: matrix.os == 'ubuntu-latest'
         run: |
+          set -e
+          # prefer repo-provided build script
           if [ -f ./build_linux.sh ]; then
             chmod +x ./build_linux.sh
             ./build_linux.sh
           else
-            mkdir -p build && cd build
+            mkdir -p build
+            cd build
             cmake .. -DCMAKE_BUILD_TYPE=Release
             cmake --build . -- -j$(nproc)
           fi
 
-      - name: Setup build deps (Windows)
+      - name: Setup build dependencies Windows
         if: matrix.os == 'windows-latest'
         shell: powershell
         run: |
-          Write-Host "Using Windows runner. Ensure Visual Studio Build Tools are available."
-          # optional: install nuget/conan or other tools here
+          Write-Host "Windows runner: Visual Studio should be preinstalled on hosted runner."
+          choco feature enable -n allowGlobalConfirmation || true
+          # optional: install tools if needed (uncomment if you want)
+          # choco install -y cmake --installargs 'ADD_CMAKE_TO_PATH=System' || true
 
-      - name: Build (Windows)
+      - name: Build on Windows
         if: matrix.os == 'windows-latest'
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
           if (Test-Path .\build_win_release.bat) {
+            Write-Host "Running repo build script build_win_release.bat"
             .\build_win_release.bat
           } else {
-            Write-Host "No build script found; try msbuild on CMake solution if present"
-            if (Test-Path .\build\Goldberg.sln) {
-              msbuild .\build\Goldberg.sln /p:Configuration=Release /m
-            }
+            # Try CMake + Visual Studio generator
+            if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build | Out-Null }
+            cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+            cmake --build build --config Release -- /m
           }
 
       - name: Collect artifacts
         run: |
+          set -e || true
           mkdir -p release_artifacts || true
-          # Linux/Windows: adjust paths if needed
-          cp -r build/bin/* release_artifacts/ 2>/dev/null || true
-          cp -r bin/* release_artifacts/ 2>/dev/null || true
-          cp goldberg* release_artifacts/ 2>/dev/null || true
+          # Linux paths
+          if [ -d build/bin ]; then cp -r build/bin/* release_artifacts/ 2>/dev/null || true; fi
+          if [ -d bin ]; then cp -r bin/* release_artifacts/ 2>/dev/null || true; fi
+          if [ -f goldberg ]; then cp goldberg release_artifacts/ 2>/dev/null || true; fi
+          # Windows: copy if present (works on both shells)
+          if [ -d build/Release ]; then cp -r build/Release/* release_artifacts/ 2>/dev/null || true; fi
+          if [ -d build ]; then find build -maxdepth 3 -type f -executable -exec cp {} release_artifacts/ \; 2>/dev/null || true; fi
           ls -la release_artifacts || true
 
       - name: Upload artifacts
