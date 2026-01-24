@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       upstream_repo:
-        description: 'Optional upstream repo URL (HTTPS). Leave empty to skip.'
+        description: 'Optional upstream repo URL'
         required: false
 
 permissions:
@@ -16,11 +16,13 @@ jobs:
   build:
     timeout-minutes: 60
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    
     steps:
-      - name: Checkout repository (full history)
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -28,169 +30,61 @@ jobs:
       - name: Determine upstream URL
         id: upstream
         shell: bash
-        env:
-          # expand repo variable here (safe place for expressions)
-          VAR_UPSTREAM: "${{ vars.UPSTREAM_REPO }}"
         run: |
-          set -euo pipefail
-          # Read event name and inputs from runner-provided env and event JSON
-          EVENT_NAME="${GITHUB_EVENT_NAME:-}"
-          INPUT_UPSTREAM=""
-          if [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH}" ]; then
-            INPUT_UPSTREAM=$(python3 - <<'PY'
-import json,os
-p=os.environ.get('GITHUB_EVENT_PATH')
-try:
-    j=json.load(open(p))
-    print(j.get('inputs',{}).get('upstream_repo','') or '')
-except Exception:
-    print('')
-PY
-)
-          fi
+          # Пріоритет: Input -> Variable -> Empty
+          URL="${{ github.event.inputs.upstream_repo }}"
+          if [ -z "$URL" ]; then URL="${{ vars.UPSTREAM_REPO }}"; fi
+          echo "url=$URL" >> $GITHUB_OUTPUT
 
-          echo "EVENT_NAME='$EVENT_NAME'"
-          echo "INPUT_UPSTREAM='$INPUT_UPSTREAM'"
-          echo "VAR_UPSTREAM='${VAR_UPSTREAM:-}'"
-
-          # priority: workflow_dispatch input -> repository variable UPSTREAM_REPO -> empty
-          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_UPSTREAM" ]; then
-            echo "url=$INPUT_UPSTREAM" >> $GITHUB_OUTPUT
-          elif [ -n "${VAR_UPSTREAM:-}" ]; then
-            echo "url=${VAR_UPSTREAM}" >> $GITHUB_OUTPUT
-          else
-            echo "url=" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Ensure latest from upstream safely
-        env:
-          UPSTREAM: ${{ steps.upstream.outputs.url }}
-          # If upstream is private and requires token, set UPSTREAM_TOKEN in repo secrets and uncomment:
-          # UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
-        run: |
-          set -e
-          echo "UPSTREAM='$UPSTREAM'"
-          if [ -z "$UPSTREAM" ]; then
-            echo "No upstream provided; skipping upstream sync."
-            exit 0
-          fi
-
-          if [ -n "${UPSTREAM_TOKEN:-}" ]; then
-            AUTH_URL=$(echo "$UPSTREAM" | sed -E "s#https://#https://x-access-token:${UPSTREAM_TOKEN}@#")
-          else
-            AUTH_URL="$UPSTREAM"
-          fi
-
-          if git ls-remote "$AUTH_URL" &>/dev/null; then
-            echo "Upstream reachable."
-            if git remote get-url upstream &>/dev/null; then
-              git remote set-url upstream "$AUTH_URL"
-            else
-              git remote add upstream "$AUTH_URL"
-            fi
-            git fetch upstream --tags --prune
-
-            UPSTREAM_REF=$(git rev-parse --verify upstream/HEAD 2>/dev/null || true)
-            if [ -z "$UPSTREAM_REF" ]; then
-              for b in upstream/main upstream/master upstream/develop; do
-                if git rev-parse --verify "$b" >/dev/null 2>&1; then
-                  UPSTREAM_REF=$(git rev-parse "$b")
-                  break
-                fi
-              done
-            fi
-
-            if [ -n "$UPSTREAM_REF" ]; then
-              echo "Checking out upstream ref"
-              git checkout -B build-upstream "$UPSTREAM_REF"
-            else
-              echo "No upstream ref found; staying on current checkout."
-            fi
-          else
-            echo "Upstream not reachable or invalid: $UPSTREAM"
-            exit 0
-          fi
-
-      - name: Setup build dependencies Linux
-        if: matrix.os == 'ubuntu-latest'
-        env:
-          DEBIAN_FRONTEND: noninteractive
-          APT_LISTCHANGES_FRONTEND: none
-          NEEDRESTART_MODE: a
+      - name: Sync Upstream
+        if: steps.upstream.outputs.url != ''
         shell: bash
         run: |
-          set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config git \
-            libssl-dev libprotobuf-dev protobuf-compiler \
-            libsdl2-dev libx11-dev libxrandr-dev libxinerama-dev \
-            libxcursor-dev libxi-dev libgl1-mesa-dev ccache || {
-              echo "apt install failed, attempting to fix broken installs"
-              sudo apt-get -y -f install || true
-              exit 1
-            }
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
+          git remote add upstream "${{ steps.upstream.outputs.url }}"
+          git fetch upstream --tags || true
+          # Спроба переключитися на гілку upstream, якщо вона існує
+          git checkout -B build-upstream upstream/main || git checkout -B build-upstream upstream/master || echo "Using local source"
 
-      - name: Build on Linux
+      # --- LINUX BUILD ---
+      - name: Install Dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
-        shell: bash
         run: |
-          set -e
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libssl-dev libprotobuf-dev \
+            protobuf-compiler libsdl2-dev libx11-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev libgl1-mesa-dev
+
+      - name: Build (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
           if [ -f ./build_linux.sh ]; then
-            chmod +x ./build_linux.sh
-            ./build_linux.sh
+            chmod +x ./build_linux.sh && ./build_linux.sh
           else
-            mkdir -p build
-            cd build
-            cmake .. -DCMAKE_BUILD_TYPE=Release
-            cmake --build . -- -j$(nproc)
+            cmake -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build -j$(nproc)
           fi
 
-      - name: Setup build dependencies Windows
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        env:
-          CHOCO_NO_PROGRESS: 'true'
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Write-Host "Windows runner: ensure choco non-interactive and basic tools (no-op if present)"
-          choco feature enable -n allowGlobalConfirmation || Write-Host "choco feature enable failed or already enabled"
-          try {
-            choco install -y --no-progress git cmake || Write-Host "choco install returned non-zero; continuing"
-          } catch {
-            Write-Host "choco install failed: $($_.Exception.Message)"
-          }
-          Write-Host "PowerShell version: $($PSVersionTable.PSVersion)"
-
-      - name: Build on Windows
+      # --- WINDOWS BUILD ---
+      - name: Build (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
           if (Test-Path .\build_win_release.bat) {
-            Write-Host "Running build_win_release.bat"
-            & .\build_win_release.bat
+            .\build_win_release.bat
           } else {
-            if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build | Out-Null }
-            cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
-            cmake --build build --config Release -- /m
+            cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+            cmake --build build --config Release
           }
 
-      - name: Collect artifacts
-        run: |
-          set -e || true
-          mkdir -p release_artifacts || true
-          if [ -d build/bin ]; then cp -r build/bin/* release_artifacts/ 2>/dev/null || true; fi
-          if [ -d bin ]; then cp -r bin/* release_artifacts/ 2>/dev/null || true; fi
-          if [ -f goldberg ]; then cp goldberg release_artifacts/ 2>/dev/null || true; fi
-          if [ -d build/Release ]; then cp -r build/Release/* release_artifacts/ 2>/dev/null || true; fi
-          ls -la release_artifacts || true
-
-      - name: Upload artifacts
+      # --- ARTIFACTS ---
+      - name: Collect and Upload
         uses: actions/upload-artifact@v4
         with:
           name: goldberg-${{ matrix.os }}
-          path: release_artifacts/**
+          path: |
+            build/bin/
+            bin/
+            build/Release/
+            goldberg*
           if-no-files-found: warn
+          
