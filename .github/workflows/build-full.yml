@@ -28,6 +28,9 @@ jobs:
       - name: Determine upstream URL
         id: upstream
         shell: bash
+        env:
+          # expand repo variable here (safe place for expressions)
+          VAR_UPSTREAM: ${{ vars.UPSTREAM_REPO || '' }}
         run: |
           set -euo pipefail
           # Read event name and inputs from runner-provided env and event JSON
@@ -39,7 +42,6 @@ import json,os
 p=os.environ.get('GITHUB_EVENT_PATH')
 try:
     j=json.load(open(p))
-    # workflow_dispatch inputs may be under 'inputs'
     print(j.get('inputs',{}).get('upstream_repo','') or '')
 except Exception:
     print('')
@@ -47,18 +49,15 @@ PY
 )
           fi
 
-          # repository variable (expanded at workflow runtime)
-          VAR_UPSTREAM="${{ vars.UPSTREAM_REPO || '' }}"
-
           echo "EVENT_NAME='$EVENT_NAME'"
           echo "INPUT_UPSTREAM='$INPUT_UPSTREAM'"
-          echo "VAR_UPSTREAM='$VAR_UPSTREAM'"
+          echo "VAR_UPSTREAM='${VAR_UPSTREAM:-}'"
 
           # priority: workflow_dispatch input -> repository variable UPSTREAM_REPO -> empty
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_UPSTREAM" ]; then
             echo "url=$INPUT_UPSTREAM" >> $GITHUB_OUTPUT
-          elif [ -n "$VAR_UPSTREAM" ]; then
-            echo "url=$VAR_UPSTREAM" >> $GITHUB_OUTPUT
+          elif [ -n "${VAR_UPSTREAM:-}" ]; then
+            echo "url=${VAR_UPSTREAM}" >> $GITHUB_OUTPUT
           else
             echo "url=" >> $GITHUB_OUTPUT
           fi
