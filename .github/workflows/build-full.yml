@@ -1,127 +1,70 @@
-name: Build Goldberg Multi-OS
-
-on:
-  push:
-    branches: [ main, master ]
-  workflow_dispatch:
-    inputs:
-      upstream_repo:
-        description: 'Optional upstream repo URL (HTTPS). Leave empty to skip.'
-        required: false
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Checkout repository (full history)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Determine upstream URL
+- name: Determine upstream URL
         id: upstream
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_UPSTREAM: ${{ github.event.inputs.upstream_repo || '' }}
+          VAR_UPSTREAM: ${{ vars.UPSTREAM_REPO || '' }}
         run: |
           # priority: workflow_dispatch input -> repository variable UPSTREAM_REPO -> empty
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.upstream_repo }}" ]; then
-            echo "url=${{ github.event.inputs.upstream_repo }}" >> $GITHUB_OUTPUT
-          elif [ -n "${{ vars.UPSTREAM_REPO }}" ]; then
-            echo "url=${{ vars.UPSTREAM_REPO }}" >> $GITHUB_OUTPUT
+          echo "EVENT_NAME='$EVENT_NAME'"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_UPSTREAM" ]; then
+            echo "url=$INPUT_UPSTREAM" >> $GITHUB_OUTPUT
+          elif [ -n "$VAR_UPSTREAM" ]; then
+            echo "url=$VAR_UPSTREAM" >> $GITHUB_OUTPUT
           else
             echo "url=" >> $GITHUB_OUTPUT
           fi
 
-      - name: Ensure latest from upstream safely
-        env:
-          UPSTREAM: ${{ steps.upstream.outputs.url }}
-          # If upstream is private and requires token, set UPSTREAM_TOKEN in repo secrets and uncomment:
-          # UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
-        run: |
-          set -e
-          echo "UPSTREAM='$UPSTREAM'"
-          if [ -z "$UPSTREAM" ]; then
-            echo "No upstream provided; skipping upstream sync."
-            exit 0
-          fi
-
-          if [ -n "${UPSTREAM_TOKEN:-}" ]; then
-            AUTH_URL=$(echo "$UPSTREAM" | sed -E "s#https://#https://x-access-token:${UPSTREAM_TOKEN}@#")
-          else
-            AUTH_URL="$UPSTREAM"
-          fi
-
-          if git ls-remote "$AUTH_URL" &>/dev/null; then
-            echo "Upstream reachable."
-            if git remote get-url upstream &>/dev/null; then
-              git remote set-url upstream "$AUTH_URL"
-            else
-              git remote add upstream "$AUTH_URL"
-            fi
-            git fetch upstream --tags --prune
-
-            UPSTREAM_REF=$(git rev-parse --verify upstream/HEAD 2>/dev/null || true)
-            if [ -z "$UPSTREAM_REF" ]; then
-              for b in upstream/main upstream/master upstream/develop; do
-                if git rev-parse --verify "$b" >/dev/null 2>&1; then
-                  UPSTREAM_REF=$(git rev-parse "$b")
-                  break
-                fi
-              done
-            fi
-
-            if [ -n "$UPSTREAM_REF" ]; then
-              echo "Checking out upstream ref"
-              git checkout -B build-upstream "$UPSTREAM_REF"
-            else
-              echo "No upstream ref found; staying on current checkout."
-            fi
-          else
-            echo "Upstream not reachable or invalid: $UPSTREAM"
-            exit 0
-          fi
-
       - name: Setup build dependencies Linux
         if: matrix.os == 'ubuntu-latest'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          APT_LISTCHANGES_FRONTEND: none
+          NEEDRESTART_MODE: a
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake pkg-config git \
-            libssl-dev libprotobuf-dev protobuf-compiler libsdl2-dev \
-            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
-            libxi-dev libgl1-mesa-dev ccache || true
-
-      - name: Build on Linux
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          set -e
-          if [ -f ./build_linux.sh ]; then
-            chmod +x ./build_linux.sh
-            ./build_linux.sh
-          else
-            mkdir -p build
-            cd build
-            cmake .. -DCMAKE_BUILD_TYPE=Release
-            cmake --build . -- -j$(nproc)
-          fi
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config git \
+            libssl-dev libprotobuf-dev protobuf-compiler \
+            libsdl2-dev libx11-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev libgl1-mesa-dev ccache || {
+              echo "apt install failed, attempting to fix broken installs"
+              sudo apt-get -y -f install || true
+              exit 1
+            }
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
 
       - name: Setup build dependencies Windows
         if: matrix.os == 'windows-latest'
-        shell: powershell
+        shell: pwsh
+        env:
+          CHOCO_NO_PROGRESS: 'true'
         run: |
-          Write-Host "Windows runner: Visual Studio should be preinstalled on hosted runner."
-          choco feature enable -n allowGlobalConfirmation || true
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Windows runner: enabling choco global confirmation and ensuring basic tools"
+          # Enable non-interactive choco
+          choco feature enable -n allowGlobalConfirmation || Write-Host "choco feature already enabled or failed"
+          # Install minimal tools if missing (no-op if already present)
+          try {
+            choco install -y --no-progress git cmake visualstudio2019buildtools || Write-Host "choco install returned non-zero; continuing"
+          } catch {
+            Write-Host "choco install failed: $($_.Exception.Message)"
+          }
+          # Ensure pwsh path is not hardcoded elsewhere; use current pwsh
+          Write-Host "PowerShell version: $($PSVersionTable.PSVersion)"
 
       - name: Build on Windows
         if: matrix.os == 'windows-latest'
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           if (Test-Path .\build_win_release.bat) {
-            .\build_win_release.bat
+            Write-Host "Running build_win_release.bat"
+            & .\build_win_release.bat
           } else {
             if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build | Out-Null }
             cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
@@ -142,4 +85,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: goldberg-${{ matrix.os }}
-          path: release_artifacts
+          path: release_artifacts/**
+          if-no-files-found: warn
