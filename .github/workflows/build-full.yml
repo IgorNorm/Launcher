@@ -30,7 +30,7 @@ jobs:
         shell: bash
         env:
           # expand repo variable here (safe place for expressions)
-          VAR_UPSTREAM: ${{ vars.UPSTREAM_REPO || '' }}
+          VAR_UPSTREAM: "${{ vars.UPSTREAM_REPO }}"
         run: |
           set -euo pipefail
           # Read event name and inputs from runner-provided env and event JSON
