@@ -20,7 +20,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -43,30 +43,36 @@ jobs:
           git fetch upstream --tags || true
           git checkout -B build-upstream upstream/main || git checkout -B build-upstream upstream/master || echo "Using local source"
 
-      # --- LINUX SETUP ---
+      # --- LINUX SETUP & BUILD ---
       - name: Install Dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          # ДОДАНО: qtbase5-dev qt5-qmake qttools5-dev-tools
-          sudo apt-get install -y build-essential cmake pkg-config libssl-dev libprotobuf-dev \
-            protobuf-compiler libsdl2-dev libx11-dev libxrandr-dev libxinerama-dev \
+          # Встановлюємо всі необхідні компоненти Qt5 та Protobuf
+          sudo apt-get install -y build-essential cmake pkg-config libssl-dev \
+            libprotobuf-dev protobuf-compiler \
+            libsdl2-dev libx11-dev libxrandr-dev libxinerama-dev \
             libxcursor-dev libxi-dev libgl1-mesa-dev \
-            qtbase5-dev qt5-qmake qttools5-dev-tools
+            qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools
 
       - name: Build (Linux)
         if: matrix.os == 'ubuntu-latest'
+        shell: bash
         run: |
-          # Якщо є скрипт - використовуємо його, інакше стандартний CMake
+          # Явно вказуємо шлях до конфігів Qt5 в Ubuntu
+          export CMAKE_PREFIX_PATH=/usr/lib/x86_64-linux-gnu/cmake/Qt5
+          
+          echo "Using Qt at: $CMAKE_PREFIX_PATH"
+
           if [ -f ./build_linux.sh ]; then
-            chmod +x ./build_linux.sh && ./build_linux.sh
+            chmod +x ./build_linux.sh
+            ./build_linux.sh
           else
-            cmake -B build -DCMAKE_BUILD_TYPE=Release
+            cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$CMAKE_PREFIX_PATH
             cmake --build build -j$(nproc)
           fi
 
-      # --- WINDOWS SETUP ---
-      # Цей крок критичний: встановлює Qt5 і прописує шляхи в PATH
+      # --- WINDOWS SETUP & BUILD ---
       - name: Install Qt (Windows)
         if: matrix.os == 'windows-latest'
         uses: jurplel/install-qt-action@v3
@@ -75,17 +81,25 @@ jobs:
           host: 'windows'
           target: 'desktop'
           arch: 'win64_msvc2019_64'
+          dir: '${{ github.workspace }}/qt5'
           setup-python: 'false'
 
       - name: Build (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
+        env:
+          # Ця змінна встановлюється автоматично install-qt-action, але ми дублюємо для надійності
+          Qt5_DIR: ${{ env.Qt5_DIR }}
         run: |
+          Write-Host "Qt installed at: $env:Qt5_DIR"
+          
           if (Test-Path .\build_win_release.bat) {
             .\build_win_release.bat
           } else {
-            # Додаємо -DCMAKE_PREFIX_PATH явно, хоча action має це робити сам
-            cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+            # Додаємо CMAKE_PREFIX_PATH, щоб він точно знайшов Qt
+            cmake -B build -G "Visual Studio 17 2022" -A x64 `
+              -DCMAKE_BUILD_TYPE=Release `
+              -DCMAKE_PREFIX_PATH="$env:Qt5_DIR"
             cmake --build build --config Release
           }
 
@@ -98,6 +112,8 @@ jobs:
             build/bin/
             bin/
             build/Release/
-            goldberg*
+            goldberg_emulator*
+            *.dll
+            *.so
           if-no-files-found: warn
           
