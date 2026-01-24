@@ -2,7 +2,7 @@ name: Build Goldberg Multi-OS
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, develop ]
   workflow_dispatch:
     inputs:
       upstream_repo:
@@ -26,7 +26,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          submodules: recursive # <--- КРИТИЧНО ВАЖЛИВО: Завантажує ресурси
+          submodules: recursive # Намагаємось завантажити одразу
+
+      - name: Force Update Submodules
+        shell: bash
+        run: |
+          # Якщо checkout не завантажив підмодулі (наприклад, папка notsecrets порожня)
+          git submodule update --init --recursive
 
       - name: Determine upstream URL
         id: upstream
@@ -42,79 +48,55 @@ jobs:
         run: |
           git remote add upstream "${{ steps.upstream.outputs.url }}"
           git fetch upstream --tags || true
-          
-          # Переключаємось на код upstream
-          if git checkout -B build-upstream upstream/main 2>/dev/null || git checkout -B build-upstream upstream/master 2>/dev/null; then
-             echo "Switched to upstream branch"
-          else
-             echo "Using local source"
-          fi
-          
-          # Оновлюємо підмодулі для upstream коду (якщо вони змінилися)
+          git checkout -B build-upstream upstream/main || git checkout -B build-upstream upstream/develop || git checkout -B build-upstream upstream/master || echo "Staying on current branch"
           git submodule sync
           git submodule update --init --recursive
 
-      # --- LINUX SETUP & BUILD ---
+      # --- LINUX ---
       - name: Install Dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          # Додано extra-cmake-modules (часто потрібен для Qt/KDE проектів)
           sudo apt-get install -y build-essential cmake pkg-config libssl-dev \
             libprotobuf-dev protobuf-compiler \
             libsdl2-dev libx11-dev libxrandr-dev libxinerama-dev \
             libxcursor-dev libxi-dev libgl1-mesa-dev \
             qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools \
-            extra-cmake-modules zlib1g-dev
+            extra-cmake-modules zlib1g-dev libghc-zlib-dev
 
       - name: Build (Linux)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
-          # Вказуємо шлях до Qt явно
           export CMAKE_PREFIX_PATH=/usr/lib/x86_64-linux-gnu/cmake/Qt5
-          
-          # Створюємо папку build, якщо її немає (для чистоти)
-          rm -rf build && mkdir build
-
-          if [ -f ./build_linux.sh ]; then
-            chmod +x ./build_linux.sh
-            ./build_linux.sh
-          else
-            # Додаємо -Wno-dev, щоб прибрати попередження, які ти бачив в логах
-            cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$CMAKE_PREFIX_PATH -Wno-dev
-            cmake --build build -j$(nproc)
+          # Створюємо заглушку для notsecrets, якщо вона все ще порожня
+          if [ ! -d "notsecrets" ] || [ -z "$(ls -A notsecrets)" ]; then
+            mkdir -p notsecrets
+            echo 'add_library(notsecrets INTERFACE)' > notsecrets/CMakeLists.txt
           fi
+          
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$CMAKE_PREFIX_PATH -Wno-dev
+          cmake --build build -j$(nproc)
 
-      # --- WINDOWS SETUP & BUILD ---
+      # --- WINDOWS ---
       - name: Install Qt (Windows)
         if: matrix.os == 'windows-latest'
         uses: jurplel/install-qt-action@v3
         with:
           version: '5.15.2'
-          host: 'windows'
-          target: 'desktop'
           arch: 'win64_msvc2019_64'
-          dir: '${{ github.workspace }}/qt5'
-          setup-python: 'false'
 
       - name: Build (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
-        env:
-          Qt5_DIR: ${{ env.Qt5_DIR }}
         run: |
-          Write-Host "Qt installed at: $env:Qt5_DIR"
-          
-          if (Test-Path .\build_win_release.bat) {
-            .\build_win_release.bat
-          } else {
-            cmake -B build -G "Visual Studio 17 2022" -A x64 `
-              -DCMAKE_BUILD_TYPE=Release `
-              -DCMAKE_PREFIX_PATH="$env:Qt5_DIR" `
-              -Wno-dev
-            cmake --build build --config Release
+          if (!(Test-Path "notsecrets") -or (Get-ChildItem "notsecrets").Count -eq 0) {
+            New-Item -ItemType Directory -Force -Path "notsecrets"
+            Set-Content -Path "notsecrets/CMakeLists.txt" -Value "add_library(notsecrets INTERFACE)"
           }
+          
+          cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -Wno-dev
+          cmake --build build --config Release
 
       # --- ARTIFACTS ---
       - name: Collect and Upload
@@ -125,8 +107,8 @@ jobs:
             build/bin/
             bin/
             build/Release/
-            goldberg_emulator*
+            build/launcher/
+            goldberg*
             *.dll
             *.so
-          if-no-files-found: warn
-          
+            
