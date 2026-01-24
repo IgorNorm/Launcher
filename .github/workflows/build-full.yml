@@ -1,13 +1,32 @@
 - name: Determine upstream URL
         id: upstream
         shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_UPSTREAM: ${{ github.event.inputs.upstream_repo || '' }}
-          VAR_UPSTREAM: ${{ vars.UPSTREAM_REPO || '' }}
         run: |
-          # priority: workflow_dispatch input -> repository variable UPSTREAM_REPO -> empty
+          set -euo pipefail
+          # Use runner-provided env GITHUB_EVENT_NAME and GITHUB_EVENT_PATH
+          EVENT_NAME="${GITHUB_EVENT_NAME:-}"
+          INPUT_UPSTREAM=""
+          if [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH}" ]; then
+            INPUT_UPSTREAM=$(python3 - <<'PY'
+import json,sys,os
+p=os.environ.get('GITHUB_EVENT_PATH')
+try:
+    j=json.load(open(p))
+    print(j.get('inputs',{}).get('upstream_repo','') or '')
+except Exception:
+    print('')
+PY
+)
+          fi
+
+          # repository variable (expanded at workflow runtime)
+          VAR_UPSTREAM="${{ vars.UPSTREAM_REPO || '' }}"
+
           echo "EVENT_NAME='$EVENT_NAME'"
+          echo "INPUT_UPSTREAM='$INPUT_UPSTREAM'"
+          echo "VAR_UPSTREAM='$VAR_UPSTREAM'"
+
+          # priority: workflow_dispatch input -> repository variable UPSTREAM_REPO -> empty
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_UPSTREAM" ]; then
             echo "url=$INPUT_UPSTREAM" >> $GITHUB_OUTPUT
           elif [ -n "$VAR_UPSTREAM" ]; then
@@ -45,16 +64,13 @@
           CHOCO_NO_PROGRESS: 'true'
         run: |
           $ErrorActionPreference = 'Stop'
-          Write-Host "Windows runner: enabling choco global confirmation and ensuring basic tools"
-          # Enable non-interactive choco
-          choco feature enable -n allowGlobalConfirmation || Write-Host "choco feature already enabled or failed"
-          # Install minimal tools if missing (no-op if already present)
+          Write-Host "Windows runner: ensure choco non-interactive and basic tools (no-op if present)"
+          choco feature enable -n allowGlobalConfirmation || Write-Host "choco feature enable failed or already enabled"
           try {
-            choco install -y --no-progress git cmake visualstudio2019buildtools || Write-Host "choco install returned non-zero; continuing"
+            choco install -y --no-progress git cmake || Write-Host "choco install returned non-zero; continuing"
           } catch {
             Write-Host "choco install failed: $($_.Exception.Message)"
           }
-          # Ensure pwsh path is not hardcoded elsewhere; use current pwsh
           Write-Host "PowerShell version: $($PSVersionTable.PSVersion)"
 
       - name: Build on Windows
