@@ -1,17 +1,45 @@
-- name: Determine upstream URL
+name: Build Goldberg Multi-OS
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: 'Optional upstream repo URL (HTTPS). Leave empty to skip.'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine upstream URL
         id: upstream
         shell: bash
         run: |
           set -euo pipefail
-          # Use runner-provided env GITHUB_EVENT_NAME and GITHUB_EVENT_PATH
+          # Read event name and inputs from runner-provided env and event JSON
           EVENT_NAME="${GITHUB_EVENT_NAME:-}"
           INPUT_UPSTREAM=""
           if [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH}" ]; then
             INPUT_UPSTREAM=$(python3 - <<'PY'
-import json,sys,os
+import json,os
 p=os.environ.get('GITHUB_EVENT_PATH')
 try:
     j=json.load(open(p))
+    # workflow_dispatch inputs may be under 'inputs'
     print(j.get('inputs',{}).get('upstream_repo','') or '')
 except Exception:
     print('')
@@ -35,6 +63,55 @@ PY
             echo "url=" >> $GITHUB_OUTPUT
           fi
 
+      - name: Ensure latest from upstream safely
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.url }}
+          # If upstream is private and requires token, set UPSTREAM_TOKEN in repo secrets and uncomment:
+          # UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
+        run: |
+          set -e
+          echo "UPSTREAM='$UPSTREAM'"
+          if [ -z "$UPSTREAM" ]; then
+            echo "No upstream provided; skipping upstream sync."
+            exit 0
+          fi
+
+          if [ -n "${UPSTREAM_TOKEN:-}" ]; then
+            AUTH_URL=$(echo "$UPSTREAM" | sed -E "s#https://#https://x-access-token:${UPSTREAM_TOKEN}@#")
+          else
+            AUTH_URL="$UPSTREAM"
+          fi
+
+          if git ls-remote "$AUTH_URL" &>/dev/null; then
+            echo "Upstream reachable."
+            if git remote get-url upstream &>/dev/null; then
+              git remote set-url upstream "$AUTH_URL"
+            else
+              git remote add upstream "$AUTH_URL"
+            fi
+            git fetch upstream --tags --prune
+
+            UPSTREAM_REF=$(git rev-parse --verify upstream/HEAD 2>/dev/null || true)
+            if [ -z "$UPSTREAM_REF" ]; then
+              for b in upstream/main upstream/master upstream/develop; do
+                if git rev-parse --verify "$b" >/dev/null 2>&1; then
+                  UPSTREAM_REF=$(git rev-parse "$b")
+                  break
+                fi
+              done
+            fi
+
+            if [ -n "$UPSTREAM_REF" ]; then
+              echo "Checking out upstream ref"
+              git checkout -B build-upstream "$UPSTREAM_REF"
+            else
+              echo "No upstream ref found; staying on current checkout."
+            fi
+          else
+            echo "Upstream not reachable or invalid: $UPSTREAM"
+            exit 0
+          fi
+
       - name: Setup build dependencies Linux
         if: matrix.os == 'ubuntu-latest'
         env:
@@ -56,6 +133,21 @@ PY
             }
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Build on Linux
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -e
+          if [ -f ./build_linux.sh ]; then
+            chmod +x ./build_linux.sh
+            ./build_linux.sh
+          else
+            mkdir -p build
+            cd build
+            cmake .. -DCMAKE_BUILD_TYPE=Release
+            cmake --build . -- -j$(nproc)
+          fi
 
       - name: Setup build dependencies Windows
         if: matrix.os == 'windows-latest'
