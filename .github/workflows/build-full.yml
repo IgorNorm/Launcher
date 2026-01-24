@@ -31,7 +31,6 @@ jobs:
         id: upstream
         shell: bash
         run: |
-          # Пріоритет: Input -> Variable -> Empty
           URL="${{ github.event.inputs.upstream_repo }}"
           if [ -z "$URL" ]; then URL="${{ vars.UPSTREAM_REPO }}"; fi
           echo "url=$URL" >> $GITHUB_OUTPUT
@@ -42,21 +41,23 @@ jobs:
         run: |
           git remote add upstream "${{ steps.upstream.outputs.url }}"
           git fetch upstream --tags || true
-          # Спроба переключитися на гілку upstream, якщо вона існує
           git checkout -B build-upstream upstream/main || git checkout -B build-upstream upstream/master || echo "Using local source"
 
-      # --- LINUX BUILD ---
+      # --- LINUX SETUP ---
       - name: Install Dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
+          # ДОДАНО: qtbase5-dev qt5-qmake qttools5-dev-tools
           sudo apt-get install -y build-essential cmake pkg-config libssl-dev libprotobuf-dev \
             protobuf-compiler libsdl2-dev libx11-dev libxrandr-dev libxinerama-dev \
-            libxcursor-dev libxi-dev libgl1-mesa-dev
+            libxcursor-dev libxi-dev libgl1-mesa-dev \
+            qtbase5-dev qt5-qmake qttools5-dev-tools
 
       - name: Build (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
+          # Якщо є скрипт - використовуємо його, інакше стандартний CMake
           if [ -f ./build_linux.sh ]; then
             chmod +x ./build_linux.sh && ./build_linux.sh
           else
@@ -64,7 +65,18 @@ jobs:
             cmake --build build -j$(nproc)
           fi
 
-      # --- WINDOWS BUILD ---
+      # --- WINDOWS SETUP ---
+      # Цей крок критичний: встановлює Qt5 і прописує шляхи в PATH
+      - name: Install Qt (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '5.15.2'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2019_64'
+          setup-python: 'false'
+
       - name: Build (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
@@ -72,6 +84,7 @@ jobs:
           if (Test-Path .\build_win_release.bat) {
             .\build_win_release.bat
           } else {
+            # Додаємо -DCMAKE_PREFIX_PATH явно, хоча action має це робити сам
             cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
             cmake --build build --config Release
           }
